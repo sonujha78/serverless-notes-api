@@ -67,9 +67,9 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "notes-api-${EnvName}"
-      Runtime: python3.99
+      Runtime: python3.12
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: "arn:aws:iam::123456789012:role/non-existent-role-for-rollback-test"
       MemorySize: !Ref LambdaMemory
       Timeout: !Ref LambdaTimeout
       Environment:
