@@ -67,7 +67,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "notes-api-${EnvName}"
-      Runtime: python3.12
+      Runtime: python3.99
       Handler: lambda_function.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       MemorySize: !Ref LambdaMemory
