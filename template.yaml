@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Serverless Notes API - Lambda + DynamoDB + API Gateway
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: Environment name (dev/prod)
+    AllowedValues: [dev, prod]
+  LambdaMemory:
+    Type: Number
+    Description: Lambda memory in MB
+    Default: 128
+  LambdaTimeout:
+    Type: Number
+    Description: Lambda timeout in seconds
+    Default: 10
+
+Resources:
+  NotesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "notes-table-${EnvName}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: noteId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: noteId
+          KeyType: HASH
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "notes-lambda-role-${EnvName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NotesTableAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !GetAtt NotesTable.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/notes-api-${EnvName}:*"
+
+  NotesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "notes-api-${EnvName}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NotesTable
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "placeholder - replaced by pipeline"}
+
+  NotesApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "notes-api-${EnvName}"
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref NotesApi
+      ParentId: !GetAtt NotesApi.RootResourceId
+      PathPart: "notes"
+
+  ApiResourceId:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref NotesApi
+      ParentId: !Ref ApiResource
+      PathPart: "{noteId}"
+
+  NotesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt NotesFunction.Arn
+
+  NotesIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref ApiResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt NotesFunction.Arn
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref NotesFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${NotesApi}/*/*"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - NotesMethod
+      - NotesIdMethod
+    Properties:
+      RestApiId: !Ref NotesApi
+      StageName: !Ref EnvName
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL of the deployed Notes API
+    Value: !Sub "https://${NotesApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvName}/notes"
+    Export:
+      Name: !Sub "notes-api-endpoint-${EnvName}"
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref NotesTable
+    Export:
+      Name: !Sub "notes-table-name-${EnvName}"
+  LambdaName:
+    Description: Lambda function name
+    Value: !Ref NotesFunction
