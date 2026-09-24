@@ -1,0 +1,188 @@
+name: Serverless Notes API Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  lint:
+    name: Lint & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install cfn-lint
+
+      - run: cfn-lint template.yaml
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - run: aws cloudformation validate-template --template-body file://template.yaml
+
+
+  test:
+    name: Unit Tests
+    needs: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements-dev.txt
+
+      - run: pytest -v
+
+
+  deploy-dev:
+    name: Deploy to Dev
+    needs: test
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Lambda code
+        run: |
+          cd src
+          zip -r ../src.zip .
+          cd ..
+
+      - name: Deploy dev stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name notes-api-dev \
+            --template-file template.yaml \
+            --parameter-overrides EnvName=dev \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Update Lambda code
+        run: |
+          aws lambda update-function-code \
+            --function-name notes-api-dev \
+            --zip-file fileb://src.zip
+
+          aws lambda wait function-updated \
+            --function-name notes-api-dev
+
+      - name: Get API endpoint
+        id: endpoint
+        run: |
+          url=$(aws cloudformation describe-stacks \
+            --stack-name notes-api-dev \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text)
+
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test dev
+        run: |
+          echo "Dev endpoint: ${{ steps.endpoint.outputs.url }}"
+
+          curl -sf "${{ steps.endpoint.outputs.url }}" || exit 1
+
+          echo "Dev smoke test PASSED"
+
+
+  deploy-prod:
+    name: Deploy to Prod (manual approval)
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Lambda code
+        run: |
+          cd src
+          zip -r ../src.zip .
+          cd ..
+
+      - name: Deploy prod stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name notes-api-prod \
+            --template-file template.yaml \
+            --parameter-overrides EnvName=prod \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Update Lambda code
+        run: |
+          aws lambda update-function-code \
+            --function-name notes-api-prod \
+            --zip-file fileb://src.zip
+
+          aws lambda wait function-updated \
+            --function-name notes-api-prod
+
+      - name: Get API endpoint
+        id: endpoint
+        run: |
+          url=$(aws cloudformation describe-stacks \
+            --stack-name notes-api-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text)
+
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test prod (full CRUD)
+        run: |
+          URL="${{ steps.endpoint.outputs.url }}"
+
+          echo "Prod endpoint: $URL"
+
+          NOTE_ID=$(curl -sf \
+            -X POST "$URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"smoke","content":"prod check"}' \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['noteId'])")
+
+          curl -sf "$URL/$NOTE_ID" \
+            | grep -q "smoke" || exit 1
+
+          curl -sf \
+            -X PUT "$URL/$NOTE_ID" \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"smoke-updated"}' \
+            | grep -q "smoke-updated" || exit 1
+
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X DELETE "$URL/$NOTE_ID")
+
+          [ "$CODE" = "204" ] || exit 1
+
+          echo "Prod smoke test PASSED (create-read-update-delete verified)"
